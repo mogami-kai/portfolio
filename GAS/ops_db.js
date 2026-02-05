@@ -9,7 +9,7 @@ const CFG = {
   // 重複チェック（ログの後ろ何行を見るか）
   DUP_CHECK_ROWS: 2000,
 
-  // 送信用（今回は未使用でもOK。Webhook受信だけなら空で動く）
+  // 送信用
   CHANNEL_ACCESS_TOKEN: ""
 };
 
