@@ -1,6 +1,6 @@
 export default {
   async fetch(request, env, ctx) {
-    const GAS_EXEC_URL = "https://script.google.com/macros/s/AKfycbyE33DHPrC2oGbxUzkrr2TSA8qJMtSR5lfaf9u7hPeBaOfB12hod1GqHDfvTonfzs3n/exec";
+    const GAS_EXEC_URL = "url";
     
     // LINE等の検証アクセス(GET)には即座に200を返して終了
     if (request.method !== "POST") {
