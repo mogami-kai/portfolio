@@ -1,0 +1,1358 @@
+Trendlinks 関連コード全出力
+作成場所: docs/all_code_output.txt
+
+============================================================
+FILE: GAS/ops_db.js
+============================================================
+const CFG = {
+  WORK_SHEET: "WORK_DAILY",
+  RAW_SHEET: "RAW_LINE",
+  LOG_SHEET: "T_LINE_MESSAGE_LOG",
+
+  // 未来日補正：今日から何日以上未来なら「前年」とみなす（年跨ぎ対策）
+  FUTURE_DAY_LIMIT: 30,
+
+  // 重複チェック（ログの後ろ何行を見るか）
+  DUP_CHECK_ROWS: 2000,
+
+  // 送信用
+  CHANNEL_ACCESS_TOKEN: ""
+};
+
+// WORK_DAILYの列（固定）
+const WORK_HEADERS = [
+  "管理ID",        // A: uniqueKey
+  "日付",          // B: yyyy/MM/dd
+  "年月",          // C: yyyy-MM
+  "取引先",        // D
+  "契約種別",      // E: 常用/請負
+  "現場",          // F
+  "職人名",        // G
+  "人工",          // H: 1.0 / 0.5 etc
+  "残業H",         // I: 0 / 1 / 1.5 etc
+  "元メッセージID",// J
+  "登録日時"       // K: yyyy/MM/dd HH:mm:ss
+];
+
+// ----------------------------------------------------
+// 初期化（手動実行OK）: シートとヘッダーを揃える
+// ----------------------------------------------------
+function initOpsDb() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // WORK_DAILY
+  let w = ss.getSheetByName(CFG.WORK_SHEET);
+  if (!w) w = ss.insertSheet(CFG.WORK_SHEET);
+  ensureHeaderRow_(w, WORK_HEADERS);
+
+  // RAW_LINE
+  let r = ss.getSheetByName(CFG.RAW_SHEET);
+  if (!r) r = ss.insertSheet(CFG.RAW_SHEET);
+  ensureHeaderRow_(r, ["Timestamp", "GroupID", "UserID", "Text"]);
+
+  // LOG
+  let l = ss.getSheetByName(CFG.LOG_SHEET);
+  if (!l) l = ss.insertSheet(CFG.LOG_SHEET);
+  ensureHeaderRow_(l, ["MessageID", "Timestamp", "GroupID", "UserID", "Text", "Status", "Detail"]);
+}
+
+// ----------------------------------------------------
+// 1) LINE Webhook エントリーポイント
+// ----------------------------------------------------
+function doPost(e) {
+  if (!e || !e.postData || !e.postData.contents) return ContentService.createTextOutput("OK");
+
+  let payload;
+  try {
+    payload = JSON.parse(e.postData.contents);
+  } catch (err) {
+    return ContentService.createTextOutput("JSON Parse Error");
+  }
+
+  const event = payload.events && payload.events[0];
+  if (!event) return ContentService.createTextOutput("No Event");
+
+  const ts = new Date(event.timestamp || Date.now());
+  const groupId = (event.source && event.source.groupId) ? event.source.groupId : "";
+  const userId  = (event.source && event.source.userId)  ? event.source.userId  : "";
+
+  // A) 送信取消（Unsend）
+  if (event.type === "unsend") {
+    const unsentMessageId = event.unsend && event.unsend.messageId;
+    if (unsentMessageId) {
+      const count = deleteByMessageId_(unsentMessageId);
+      appendLog_(ts, unsentMessageId, groupId, userId, "[UNSEND]", "DELETED", `削除件数: ${count}`);
+    }
+    return ContentService.createTextOutput("OK");
+  }
+
+  // B) テキストメッセージ受信
+  if (event.type === "message" && event.message && event.message.type === "text") {
+    const messageId = String(event.message.id || "");
+    const messageText = String(event.message.text || "");
+
+    // 生ログ
+    appendRawLineSafe_(ts, groupId, userId, messageText);
+
+    // 重複チェック
+    if (isDuplicateMessageId_(messageId)) {
+      appendLog_(ts, messageId, groupId, userId, messageText, "DUPLICATE", "処理スキップ");
+      return ContentService.createTextOutput("OK");
+    }
+
+    // 登録
+    try {
+      const result = processLineMessage_(messageText, messageId, ts);
+      appendLog_(ts, messageId, groupId, userId, messageText, "SUCCESS", `登録: ${result.rows}件`);
+    } catch (err) {
+      appendLog_(ts, messageId, groupId, userId, messageText, "ERROR", err && err.stack ? err.stack : String(err));
+    }
+  }
+
+  return ContentService.createTextOutput("OK");
+}
+
+// ----------------------------------------------------
+// 2) メイン処理：テキスト解析 → WORK_DAILYへ追記
+// ----------------------------------------------------
+function processLineMessage_(text, messageId, receivedAt) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CFG.WORK_SHEET);
+  if (!sheet) throw new Error(`シートが見つかりません: ${CFG.WORK_SHEET}`);
+
+  // ヘッダーがズレてると Middle_db 側も崩れるので、最低限揃える
+  ensureHeaderRow_(sheet, WORK_HEADERS);
+
+  const lines = String(text)
+    .split(/\r\n|\r|\n/)
+    .map(s => String(s).trim())
+    .filter(Boolean);
+
+  let currentDate = null;
+  let currentClient = "";
+  let currentWorkType = ""; // 常用/請負
+  let currentSite = "";
+
+  let nextIsClient = false;
+  let nextIsSite = false;
+
+  // ブロック共通指定（後付け上書き）
+  let blockDefaultQty = null;
+  let blockDefaultOt  = null;
+  let blockStartIndex = 0;
+
+  const newRows = [];
+  const tz = Session.getScriptTimeZone();
+  const nowStr = Utilities.formatDate(new Date(), tz, "yyyy/MM/dd HH:mm:ss");
+
+  for (const rawLine of lines) {
+
+    // A) 日付判定
+    const dateObj = parseDateLineFlex_(rawLine, receivedAt);
+    if (dateObj) {
+      currentDate = dateObj;
+
+      // ブロック初期化
+      currentClient = "";
+      currentWorkType = "";
+      currentSite = "";
+      blockDefaultQty = null;
+      blockDefaultOt = null;
+
+      nextIsClient = true;
+      nextIsSite = false;
+      continue;
+    }
+    if (!currentDate) continue;
+
+    // B) 取引先 + 契約種別 + (混在なら現場も)
+    if (nextIsClient) {
+      const parsed = parseClientWorkTypeAndMaybeSite_(rawLine);
+
+      currentClient = parsed.clientName;
+      currentWorkType = parsed.workType;
+
+      if (parsed.siteName) {
+        currentSite = parsed.siteName;
+        nextIsClient = false;
+        nextIsSite = false;
+
+        blockStartIndex = newRows.length;
+        blockDefaultQty = null;
+        blockDefaultOt = null;
+      } else {
+        nextIsClient = false;
+        nextIsSite = true;
+      }
+      continue;
+    }
+
+    // C) 現場
+    if (nextIsSite) {
+      currentSite = rawLine;
+      nextIsSite = false;
+
+      blockStartIndex = newRows.length;
+      blockDefaultQty = null;
+      blockDefaultOt = null;
+      continue;
+    }
+
+    // C-2) 共通指定（人工のみ）
+    const qtyOnly = parseQtyOnlyLine_(rawLine);
+    if (qtyOnly !== null) {
+      blockDefaultQty = qtyOnly;
+      for (let i = blockStartIndex; i < newRows.length; i++) newRows[i][7] = blockDefaultQty; // H:人工
+      continue;
+    }
+
+    // C-3) 共通指定（残業のみ）
+    const otOnly = parseOtOnlyLine_(rawLine);
+    if (otOnly !== null) {
+      blockDefaultOt = otOnly;
+      for (let i = blockStartIndex; i < newRows.length; i++) newRows[i][8] = blockDefaultOt; // I:残業H
+      continue;
+    }
+
+    // D) 職人行（カオス対応）
+    const workers = parseWorkerLineChaos_(rawLine);
+    if (workers.length > 0) {
+      const ym = Utilities.formatDate(currentDate, tz, "yyyy-MM");
+      const dateFormatted = Utilities.formatDate(currentDate, tz, "yyyy/MM/dd");
+
+      for (let idx = 0; idx < workers.length; idx++) {
+        const w = workers[idx];
+
+        // ✅ Middle_db 側でUPSERTしやすいように messageId + idx
+        const uniqueKey = `${messageId}_${idx}`;
+
+        // 個別指定 > 共通指定 > デフォルト
+        const qtyFinal = w.hasQty ? w.qty : (blockDefaultQty !== null ? blockDefaultQty : 1.0);
+        const otFinal  = w.hasOt  ? w.ot  : (blockDefaultOt  !== null ? blockDefaultOt  : 0);
+
+        newRows.push([
+          uniqueKey,        // A 管理ID
+          dateFormatted,    // B 日付
+          ym,               // C 年月
+          currentClient,    // D 取引先
+          currentWorkType,  // E 契約種別
+          currentSite,      // F 現場
+          w.name,           // G 職人名
+          qtyFinal,         // H 人工
+          otFinal,          // I 残業H
+          messageId,        // J 元メッセージID
+          nowStr            // K 登録日時
+        ]);
+      }
+    }
+  }
+
+  if (newRows.length > 0) {
+    const lastRow = sheet.getLastRow();
+    sheet.getRange(lastRow + 1, 1, newRows.length, WORK_HEADERS.length).setValues(newRows);
+
+    // 書式（最低限）
+    sheet.getRange(lastRow + 1, 2, newRows.length, 1).setNumberFormat("yyyy/mm/dd"); // 日付
+    sheet.getRange(lastRow + 1, 8, newRows.length, 2).setNumberFormat("0.00");       // 人工・残業H
+  }
+
+  return { rows: newRows.length };
+}
+
+// ----------------------------------------------------
+// 3) パース関数群
+// ----------------------------------------------------
+
+// 日付解析（曜日/英語曜日/括弧などがあっても数字だけ拾う）
+function parseDateLineFlex_(text, baseDate) {
+  // ✅ / を潰さない正規化
+  const s = normalizeText_(text).replace(/\s/g, "");
+
+  // 2026/01/16, 2026-01-16
+  let m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+
+  // 1/16(火) / 01/16 / 1-16 / 1/16Tue
+  m = s.match(/(\d{1,2})[\/\-](\d{1,2})/);
+  if (m) return fixFutureDate_(baseDate, Number(m[1]), Number(m[2]));
+
+  // 1月16日
+  m = s.match(/(\d{1,2})月(\d{1,2})/);
+  if (m) return fixFutureDate_(baseDate, Number(m[1]), Number(m[2]));
+
+  return null;
+}
+
+// 未来日付補正
+function fixFutureDate_(baseDate, mm, dd) {
+  const y = baseDate.getFullYear();
+  let d = new Date(y, mm - 1, dd);
+
+  const diff = (d - baseDate) / (1000 * 60 * 60 * 24);
+
+  // 未来すぎる → 去年に戻す
+  if (diff > CFG.FUTURE_DAY_LIMIT) return new Date(y - 1, mm - 1, dd);
+
+  // 過去すぎる（年跨ぎ直後のメッセージなど） → 来年に寄せる
+  if (diff < -300) return new Date(y + 1, mm - 1, dd);
+
+  return d;
+}
+
+// 取引先行：常用/請負抽出 + 1行に現場が混ざる場合も拾う
+function parseClientWorkTypeAndMaybeSite_(line) {
+  // ✅ / | を保持したまま統一
+  let normalized = normalizeText_(line)
+    .replace(/[　]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let clientPart = normalized;
+  let sitePart = "";
+
+  // 例: "恵興業 常用 / 追浜造船所"
+  // 例: "恵興業 常用｜追浜造船所"
+  if (/[\/|]/.test(normalized)) {
+    const parts = normalized.split(/[\/|]/).map(s => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      clientPart = parts[0];
+      sitePart = parts.slice(1).join(" / ");
+    }
+  }
+
+  const hasJoyo = /常用/.test(clientPart);
+  const hasUkeoi = /請負/.test(clientPart);
+
+  let workType = "";
+  if (hasJoyo) workType = "常用";
+  if (hasUkeoi) workType = "請負";
+
+  let clientName = clientPart
+    .replace(/常用/g, "")
+    .replace(/請負/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return { clientName, workType, siteName: sitePart };
+}
+
+// 共通指定：人工だけの行
+function parseQtyOnlyLine_(line) {
+  const raw = normalizeText_(line).toLowerCase().trim();
+  const s = raw.replace(/\s+/g, "");
+
+  // 半日系
+  if (["半日", "半", "半勤", "午前", "午後", "午前のみ", "午後のみ", "am", "pm", "半日勤務"].includes(raw)) return 0.5;
+
+  // 1日系
+  if (["一日", "1日", "１日", "全日"].includes(raw)) return 1.0;
+
+  // 0.5 / 0.5日 / 0.5day
+  let m = s.match(/^([0-9]+(\.[0-9]+)?)\s*(日|day)?$/);
+  if (m) return parseFloat(m[1]);
+
+  // 人工0.5 / 稼働0.5
+  m = s.match(/^(人工|稼働)\s*([0-9]+(\.[0-9]+)?)$/);
+  if (m) return parseFloat(m[2]);
+
+  return null;
+}
+
+// 共通指定：残業だけの行
+function parseOtOnlyLine_(line) {
+  const raw = normalizeText_(line).toLowerCase().trim();
+  const s = raw.replace(/\s+/g, "");
+
+  // 残業1 / 残業1h / 残業1時間
+  let m = s.match(/^残業([0-9]+(\.[0-9]+)?)((h|時間)?)$/);
+  if (m) return parseFloat(m[1]);
+
+  // 残1
+  m = s.match(/^残([0-9]+(\.[0-9]+)?)$/);
+  if (m) return parseFloat(m[1]);
+
+  // 1h / +1h
+  m = s.match(/^\+?([0-9]+(\.[0-9]+)?)h$/);
+  if (m) return parseFloat(m[1]);
+
+  // OT1 / OT1h / overtime1h
+  m = s.match(/^ot([0-9]+(\.[0-9]+)?)h?$/);
+  if (m) return parseFloat(m[1]);
+
+  m = s.match(/^overtime([0-9]+(\.[0-9]+)?)h?$/);
+  if (m) return parseFloat(m[1]);
+
+  return null;
+}
+
+// カオス混在：名前と状態が同一行で順不同でもOK
+function parseWorkerLineChaos_(line) {
+  const tokens = tokenizeChaos_(line);
+  if (tokens.length === 0) return [];
+
+  // 名前判定（状態語や英数は除外）
+  const isName = (t) => {
+    if (!t) return false;
+    if (isStatusToken_(t)) return false;
+    return /^[一-龥々ぁ-んァ-ヶ]{1,12}$/.test(t);
+  };
+
+  const workers = [];
+  let current = null;
+
+  // 状態が先に来たとき用
+  let pending = { qty: null, ot: null };
+
+  for (const t of tokens) {
+    // 状態
+    const st = parseStatusToken_(t);
+    if (st) {
+      if (current) {
+        if (st.qty !== null) { current.qty = st.qty; current.hasQty = true; }
+        if (st.ot  !== null) { current.ot  = st.ot;  current.hasOt  = true; }
+      } else {
+        if (st.qty !== null) pending.qty = st.qty;
+        if (st.ot  !== null) pending.ot  = st.ot;
+      }
+      continue;
+    }
+
+    // 名前
+    if (isName(t)) {
+      if (current) workers.push(current);
+      current = { name: t, qty: 1.0, ot: 0, hasQty: false, hasOt: false };
+
+      // pending 適用
+      if (pending.qty !== null) { current.qty = pending.qty; current.hasQty = true; }
+      if (pending.ot  !== null) { current.ot  = pending.ot;  current.hasOt  = true; }
+      pending = { qty: null, ot: null };
+      continue;
+    }
+
+    // 数字だけ → 人工（個別指定）
+    const num = parseFloatSafe_(t);
+    if (num !== null) {
+      if (current) {
+        current.qty = num;
+        current.hasQty = true;
+      } else {
+        pending.qty = num;
+      }
+      continue;
+    }
+  }
+
+  if (current) workers.push(current);
+
+  // 0人なら誤爆なので空
+  if (workers.length === 0) return [];
+
+  return workers;
+}
+
+// ----------------------------------------------------
+// 4) 正規化/トークン化/状態判定
+// ----------------------------------------------------
+
+// ✅ 改訂：/ と | を潰さない（＝日付/取引先分割が死なない）
+function normalizeText_(text) {
+  let s = String(text || "");
+  if (s.normalize) s = s.normalize("NFKC");
+
+  s = s
+    .replace(/[　]+/g, " ")
+    .replace(/[、，,]/g, " ")
+    .replace(/[。．]/g, ".")
+    .replace(/[＋+]/g, "+");
+
+  // 全角を半角に寄せるが、記号自体は保持
+  s = s
+    .replace(/／/g, "/")
+    .replace(/｜/g, "|");
+
+  return s;
+}
+
+// ✅ 職人行専用：ここでだけ / | を空白にする（名前抽出の邪魔を消す）
+function tokenizeChaos_(line) {
+  let s = normalizeText_(line);
+
+  // かっこ類は空白化
+  s = s.replace(/[（）\(\)\[\]【】]/g, " ");
+
+  // 職人行では区切り記号は邪魔なので空白化
+  s = s.replace(/[\/|]/g, " ");
+
+  // 「残業 1 h」→「1h」
+  s = s.replace(/(\d)\s*h\b/gi, "$1h");
+
+  // 連続スペース整理
+  s = s.replace(/\s+/g, " ").trim();
+  if (!s) return [];
+
+  return s.split(" ").filter(Boolean);
+}
+
+function parseFloatSafe_(t) {
+  const s = String(t || "").trim();
+  if (!s) return null;
+  if (!/^([0-9]+(\.[0-9]+)?)$/.test(s)) return null;
+  const v = parseFloat(s);
+  return isNaN(v) ? null : v;
+}
+
+function isStatusToken_(t) {
+  return !!parseStatusToken_(t);
+}
+
+function parseStatusToken_(token) {
+  const raw = normalizeText_(token).toLowerCase().trim();
+  const s = raw.replace(/\s+/g, "");
+
+  // 半日系（人工=0.5）
+  if (["半日", "半", "半勤", "午前", "午後", "午前のみ", "午後のみ", "am", "pm", "半日勤務"].includes(raw)) {
+    return { qty: 0.5, ot: null };
+  }
+
+  // 0.5日 / 0.5day（数字単独は人工と衝突するため「日/day付きのみ」）
+  let m = s.match(/^([0-9]+(\.[0-9]+)?)((日|day))$/);
+  if (m) return { qty: parseFloat(m[1]), ot: null };
+
+  // 残業1 / 残業1h / 残業1時間
+  m = s.match(/^残業([0-9]+(\.[0-9]+)?)((h|時間)?)$/);
+  if (m) return { qty: null, ot: parseFloat(m[1]) };
+
+  // 残1
+  m = s.match(/^残([0-9]+(\.[0-9]+)?)$/);
+  if (m) return { qty: null, ot: parseFloat(m[1]) };
+
+  // 1h / +1h
+  m = s.match(/^\+?([0-9]+(\.[0-9]+)?)h$/);
+  if (m) return { qty: null, ot: parseFloat(m[1]) };
+
+  // OT1 / OT1h
+  m = s.match(/^ot([0-9]+(\.[0-9]+)?)h?$/);
+  if (m) return { qty: null, ot: parseFloat(m[1]) };
+
+  // overtime1h
+  m = s.match(/^overtime([0-9]+(\.[0-9]+)?)h?$/);
+  if (m) return { qty: null, ot: parseFloat(m[1]) };
+
+  return null;
+}
+
+// ----------------------------------------------------
+// 5) ログ・削除・ユーティリティ
+// ----------------------------------------------------
+function ensureHeaderRow_(sheet, headers) {
+  const lastCol = Math.max(sheet.getLastColumn(), headers.length);
+  const row1 = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  // 1行目が空っぽに近いなら書く
+  const hasAny = row1.some(v => String(v || "").trim() !== "");
+  if (!hasAny) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    return;
+  }
+
+  // すでに何かある場合：足りない分だけ右に足す（既存列を壊さない）
+  for (let i = 0; i < headers.length; i++) {
+    const cur = String(row1[i] || "").trim();
+    if (!cur) sheet.getRange(1, i + 1).setValue(headers[i]);
+  }
+}
+
+function appendLog_(ts, msgId, groupId, userId, text, status, detail) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CFG.LOG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CFG.LOG_SHEET);
+    sheet.getRange(1, 1, 1, 7).setValues([["MessageID", "Timestamp", "GroupID", "UserID", "Text", "Status", "Detail"]]);
+  }
+  sheet.appendRow([
+    String(msgId || ""),
+    Utilities.formatDate(ts, Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss"),
+    String(groupId || ""),
+    String(userId || ""),
+    String(text || ""),
+    String(status || ""),
+    String(detail || "")
+  ]);
+}
+
+function isDuplicateMessageId_(msgId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CFG.LOG_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return false;
+
+  const lastRow = sheet.getLastRow();
+  const startRow = Math.max(2, lastRow - CFG.DUP_CHECK_ROWS + 1);
+  const data = sheet.getRange(startRow, 1, lastRow - startRow + 1, 1).getValues();
+
+  const ids = data.flat().map(String);
+  return ids.includes(String(msgId));
+}
+
+function appendRawLineSafe_(ts, groupId, userId, text) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CFG.RAW_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CFG.RAW_SHEET);
+    sheet.getRange(1, 1, 1, 4).setValues([["Timestamp", "GroupID", "UserID", "Text"]]);
+  }
+
+  sheet.appendRow([
+    Utilities.formatDate(ts, Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss"),
+    String(groupId || ""),
+    String(userId || ""),
+    String(text || "")
+  ]);
+}
+
+function deleteByMessageId_(msgId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(CFG.WORK_SHEET);
+  if (!sheet) return 0;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  // J列（10列目）が「元メッセージID」
+  const ids = sheet.getRange(2, 10, lastRow - 1, 1).getValues().flat().map(String);
+  const targetId = String(msgId);
+
+  const rowsToDelete = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (ids[i] === targetId) rowsToDelete.push(i + 2);
+  }
+
+  rowsToDelete.reverse().forEach(r => sheet.deleteRow(r));
+  return rowsToDelete.length;
+}
+
+============================================================
+FILE: GAS/middle_db.js
+============================================================
+const OPS_SS_ID = "1iBY2DnltjGbAltS0OtQer1Wn9vaZf2G2vFlaPPAk3RQ";
+const OPS_SHEET_NAME = "WORK_DAILY";
+
+const REVIEW_SHEET   = "REVIEW_DAILY";
+const APPROVED_SHEET = "APPROVED_DAILY";
+const REJECTED_SHEET = "REJECTED_LOG";
+
+const UPSERT_OPEN_ROWS = true;
+
+// ============================
+// メニュー（4つ）
+// ============================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("管理メニュー")
+    .addItem("① 現場データを取り込む（同期）", "syncOpsToReview")
+    .addItem("② OPENを承認して確定する", "approveOpenToApproved")
+    .addItem("③ OPENを却下してREJECTへ", "rejectOpenToRejected")
+    .addSeparator()
+    .addItem("⚠️ 全データを初期化（リセット）", "emergencyReset")
+    .addToUi();
+}
+
+// ============================
+// 必要シートを自動作成 + ヘッダー強制
+// ============================
+function ensureSheets_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  let review    = ss.getSheetByName(REVIEW_SHEET);
+  let approved  = ss.getSheetByName(APPROVED_SHEET);
+  let rejected  = ss.getSheetByName(REJECTED_SHEET);
+
+  if (!review)   review   = ss.insertSheet(REVIEW_SHEET);
+  if (!approved) approved = ss.insertSheet(APPROVED_SHEET);
+  if (!rejected) rejected = ss.insertSheet(REJECTED_SHEET);
+
+  // REVIEWヘッダー（A〜Z / 26列）
+  const reviewHeader = [
+    "管理ID","日付","年月","取引先名","契約種別（常用/請負）","現場名","職人名","人工","残業H","元メッセージID","登録日時",
+    "状態","承認者","承認時刻",
+    "【手動】取引先名","【手動】契約種別","【手動】現場名","【手動】職人名","【手動】人工","【手動】残業H",
+    "最終_取引先名","最終_契約種別","最終_現場名","最終_職人名","最終_人工","最終_残業H"
+  ];
+
+  // APPROVEDヘッダー（A〜N / 14列）
+  const approvedHeader = [
+    "管理ID","日付","年月","取引先名","契約種別（常用/請負）","現場名","職人名","人工","残業H",
+    "元メッセージID","登録日時","状態","承認者","承認時刻"
+  ];
+
+  // REJECTEDヘッダー（A〜O / 15列）
+  const rejectedHeader = [
+    "管理ID","日付","年月","取引先名","契約種別（常用/請負）","現場名","職人名","人工","残業H",
+    "元メッセージID","登録日時","状態","却下者","却下時刻","却下理由"
+  ];
+
+  const ensureHeader = (sheet, headerArr) => {
+    const lastCol = Math.max(sheet.getLastColumn(), headerArr.length);
+    const row1 = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    const current = row1.slice(0, headerArr.length).map(v => String(v || "").trim());
+    const expected = headerArr.map(v => String(v).trim());
+    const same = JSON.stringify(current) === JSON.stringify(expected);
+
+    if (!same) {
+      sheet.getRange(1, 1, 1, headerArr.length).setValues([headerArr]);
+    }
+  };
+
+  ensureHeader(review, reviewHeader);
+  ensureHeader(approved, approvedHeader);
+  ensureHeader(rejected, rejectedHeader);
+
+  // REVIEWの数式(U〜Z)は常に維持
+  setFormulasToReview_(review);
+
+  review.setFrozenRows(1);
+  approved.setFrozenRows(1);
+  rejected.setFrozenRows(1);
+
+  return { review, approved, rejected };
+}
+
+// ============================
+// ① 同期：Ops → REVIEW
+// ============================
+function syncOpsToReview() {
+  const { review, approved, rejected } = ensureSheets_();
+
+  const ops = getOpsSheet_();
+  const opsLastRow = getRealLastRow_(ops);
+  if (opsLastRow < 2) {
+    SpreadsheetApp.getUi().alert("Ops側にデータがありません");
+    return;
+  }
+
+  const idx = buildHeaderIndexMap_(ops);
+
+  const opsLastCol = ops.getLastColumn();
+  const opsData = ops.getRange(2, 1, opsLastRow - 1, opsLastCol).getValues();
+
+  // APPROVEDにあるIDは触らない
+  const approvedIds = new Set();
+  const approvedLast = getRealLastRow_(approved);
+  if (approvedLast >= 2) {
+    approved.getRange(2, 1, approvedLast - 1, 1).getValues().flat()
+      .forEach(id => approvedIds.add(String(id)));
+  }
+
+  // REJECTEDにあるIDも基本スキップ（却下済を復活させたくない前提）
+  const rejectedIds = new Set();
+  const rejectedLast = getRealLastRow_(rejected);
+  if (rejectedLast >= 2) {
+    rejected.getRange(2, 1, rejectedLast - 1, 1).getValues().flat()
+      .forEach(id => rejectedIds.add(String(id)));
+  }
+
+  // REVIEW内のID→行番号（UPSERT用）
+  const reviewIdToRow = new Map();
+  const reviewLast = getRealLastRow_(review);
+  if (reviewLast >= 2) {
+    const ids = review.getRange(2, 1, reviewLast - 1, 1).getValues().flat();
+    ids.forEach((id, i) => {
+      if (id) reviewIdToRow.set(String(id), i + 2);
+    });
+  }
+
+  let appended = 0;
+  let updated = 0;
+  const newRows = [];
+
+  for (const r of opsData) {
+    const key = String(r[idx.管理ID] ?? "").trim();
+    if (!key) continue;
+
+    if (approvedIds.has(key)) continue;
+    if (rejectedIds.has(key)) continue;
+
+    // REVIEWにあるなら更新（OPENのみ）
+    if (UPSERT_OPEN_ROWS && reviewIdToRow.has(key)) {
+      const rowNum = reviewIdToRow.get(key);
+      const status = String(review.getRange(rowNum, 12).getValue()); // L=状態
+      if (status === "OPEN") {
+        review.getRange(rowNum, 1, 1, 11).setValues([extractOpsRow11_(r, idx)]);
+        updated++;
+      }
+      continue;
+    }
+
+    // REVIEWに無い → 新規追加
+    const base11 = extractOpsRow11_(r, idx);
+    newRows.push([
+      ...base11,
+      "OPEN", "", "",
+      "", "", "", "", "", ""
+    ]);
+  }
+
+  // 新規追加
+  if (newRows.length > 0) {
+    const startRow = Math.max(2, getRealLastRow_(review) + 1);
+    review.getRange(startRow, 1, newRows.length, 20).setValues(newRows);
+    appended = newRows.length;
+  }
+
+  setFormulasToReview_(review);
+
+  SpreadsheetApp.getUi().alert(`同期完了 ✅\n追加: ${appended}件\n更新: ${updated}件`);
+}
+
+// ============================
+// ② 承認：REVIEW(OPEN) → APPROVED
+// ============================
+function approveOpenToApproved() {
+  const { review, approved } = ensureSheets_();
+
+  const me = Session.getActiveUser().getEmail();
+  const now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+
+  const last = getRealLastRow_(review);
+  if (last < 2) {
+    SpreadsheetApp.getUi().alert("データがありません");
+    return;
+  }
+
+  const data = review.getRange(2, 1, last - 1, 26).getValues();
+
+  const push = [];
+  const deleteRows = [];
+
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][11]) !== "OPEN") continue;
+
+    // 最終値（U〜Z）
+    const finalClient   = data[i][20];
+    const finalWorkType = data[i][21];
+    const finalSite     = data[i][22];
+    const finalWorker   = data[i][23];
+    const finalQty      = data[i][24];
+    const finalOt       = data[i][25];
+
+    push.push([
+      data[i][0], data[i][1], data[i][2],
+      finalClient, finalWorkType, finalSite,
+      finalWorker, finalQty, finalOt,
+      data[i][9], data[i][10],
+      "APPROVED", me, now
+    ]);
+
+    deleteRows.push(i + 2);
+  }
+
+  if (push.length === 0) {
+    SpreadsheetApp.getUi().alert("承認対象（OPEN）がありません");
+    return;
+  }
+
+  const start = Math.max(2, getRealLastRow_(approved) + 1);
+  approved.getRange(start, 1, push.length, 14).setValues(push);
+
+  // REVIEWから削除
+  deleteRows.sort((a, b) => b - a);
+  deleteRows.forEach(r => {
+    if (r === 2) {
+      review.getRange(2, 1, 1, 20).clearContent();
+    } else {
+      review.deleteRow(r);
+    }
+  });
+
+  setFormulasToReview_(review);
+
+  SpreadsheetApp.getUi().alert(`${push.length}件 承認しました ✅`);
+}
+
+// ============================
+// ③ 却下：REVIEW(OPEN) → REJECTED_LOG（理由付き）
+// ============================
+function rejectOpenToRejected() {
+  const { review, rejected } = ensureSheets_();
+  const ui = SpreadsheetApp.getUi();
+
+  const last = getRealLastRow_(review);
+  if (last < 2) {
+    ui.alert("データがありません");
+    return;
+  }
+
+  // 却下理由を入力（全件共通）
+  const res = ui.prompt("却下理由", "例）名前誤り / 現場違い / 二重送信 など", ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+
+  const reason = String(res.getResponseText() || "").trim();
+  if (!reason) {
+    ui.alert("却下理由が空です。キャンセルしました。");
+    return;
+  }
+
+  const me = Session.getActiveUser().getEmail();
+  const now = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss");
+
+  // A〜Z（26列）
+  const data = review.getRange(2, 1, last - 1, 26).getValues();
+
+  const push = [];
+  const deleteRows = [];
+
+  for (let i = 0; i < data.length; i++) {
+    if (String(data[i][11]) !== "OPEN") continue;
+
+    // 最終値（U〜Z）
+    const finalClient   = data[i][20];
+    const finalWorkType = data[i][21];
+    const finalSite     = data[i][22];
+    const finalWorker   = data[i][23];
+    const finalQty      = data[i][24];
+    const finalOt       = data[i][25];
+
+    push.push([
+      data[i][0], data[i][1], data[i][2],
+      finalClient, finalWorkType, finalSite,
+      finalWorker, finalQty, finalOt,
+      data[i][9], data[i][10],
+      "REJECTED", me, now, reason
+    ]);
+
+    deleteRows.push(i + 2);
+  }
+
+  if (push.length === 0) {
+    ui.alert("却下対象（OPEN）がありません");
+    return;
+  }
+
+  const start = Math.max(2, getRealLastRow_(rejected) + 1);
+  rejected.getRange(start, 1, push.length, 15).setValues(push);
+
+  // REVIEWから削除
+  deleteRows.sort((a, b) => b - a);
+  deleteRows.forEach(r => {
+    if (r === 2) {
+      review.getRange(2, 1, 1, 20).clearContent();
+    } else {
+      review.deleteRow(r);
+    }
+  });
+
+  setFormulasToReview_(review);
+
+  ui.alert(`${push.length}件 却下しました ✅\n理由：${reason}`);
+}
+
+// ============================
+// REVIEW 数式注入（U〜Z）
+// ============================
+function setFormulasToReview_(sheet) {
+  const formulas = [[
+    '=ARRAYFORMULA(IF(A2:A="","",IF(O2:O<>"",O2:O,D2:D)))', // U 最終_取引先名
+    '=ARRAYFORMULA(IF(A2:A="","",IF(P2:P<>"",P2:P,E2:E)))', // V 最終_契約種別
+    '=ARRAYFORMULA(IF(A2:A="","",IF(Q2:Q<>"",Q2:Q,F2:F)))', // W 最終_現場名
+    '=ARRAYFORMULA(IF(A2:A="","",IF(R2:R<>"",R2:R,G2:G)))', // X 最終_職人名
+    '=ARRAYFORMULA(IF(A2:A="","",IF(S2:S<>"",S2:S,H2:H)))', // Y 最終_人工
+    '=ARRAYFORMULA(IF(A2:A="","",IF(T2:T<>"",T2:T,I2:I)))'  // Z 最終_残業H
+  ]];
+
+  sheet.getRange("U2:Z2").setFormulas(formulas);
+}
+
+// ============================
+// Ops取得
+// ============================
+function getOpsSheet_() {
+  const opsSS = SpreadsheetApp.openById(OPS_SS_ID);
+  const ops = opsSS.getSheetByName(OPS_SHEET_NAME);
+  if (!ops) throw new Error(`Opsにシート「${OPS_SHEET_NAME}」がありません`);
+  return ops;
+}
+
+// ============================
+// Opsヘッダー自動判定（列ズレ耐性）
+// ============================
+function buildHeaderIndexMap_(opsSheet) {
+  const header = opsSheet.getRange(1, 1, 1, opsSheet.getLastColumn()).getValues()[0]
+    .map(v => String(v || "").trim());
+
+  const find = (candidates) => {
+    for (let i = 0; i < header.length; i++) {
+      const h = header[i];
+      if (!h) continue;
+      if (candidates.includes(h)) return i;
+    }
+    return -1;
+  };
+
+  const map = {
+    管理ID: find(["管理ID", "ID"]),
+    日付: find(["日付"]),
+    年月: find(["年月"]),
+    取引先名: find(["取引先名", "元請", "元請名"]),
+    契約種別: find(["契約種別（常用/請負）", "契約種別", "常用/請負"]),
+    現場名: find(["現場名", "現場"]),
+    職人名: find(["職人名", "職人"]),
+    人工: find(["人工"]),
+    残業H: find(["残業H", "残業"]),
+    元メッセージID: find(["元メッセージID", "messageId", "messageid"]),
+    登録日時: find(["登録日時", "受信時刻", "受信日時"])
+  };
+
+  if (map.管理ID === -1) throw new Error("Opsのヘッダーに「管理ID」が見つかりません。");
+  if (map.日付 === -1) throw new Error("Opsのヘッダーに「日付」が見つかりません。");
+  if (map.年月 === -1) throw new Error("Opsのヘッダーに「年月」が見つかりません。");
+
+  return map;
+}
+
+// ============================
+// Ops1行 → REVIEW A〜K(11列)
+// ============================
+function extractOpsRow11_(r, idx) {
+  const safe = (i) => (i === -1 ? "" : r[i]);
+  return [
+    safe(idx.管理ID),
+    safe(idx.日付),
+    safe(idx.年月),
+    safe(idx.取引先名),
+    safe(idx.契約種別),
+    safe(idx.現場名),
+    safe(idx.職人名),
+    safe(idx.人工),
+    safe(idx.残業H),
+    safe(idx.元メッセージID),
+    safe(idx.登録日時)
+  ];
+}
+
+// ============================
+// 最終行（A列基準）
+// ============================
+function getRealLastRow_(sheet) {
+  const vals = sheet.getRange("A:A").getValues();
+  for (let i = vals.length - 1; i >= 0; i--) {
+    if (vals[i][0] !== "" && vals[i][0] != null) return i + 1;
+  }
+  return 0;
+}
+
+// ============================
+// ⚠️ 緊急リセット（REVIEW/APPROVED/REJECTED全消し）
+// ============================
+function emergencyReset() {
+  const { review, approved, rejected } = ensureSheets_();
+  const ui = SpreadsheetApp.getUi();
+
+  const ok = ui.alert("⚠️ 警告", "REVIEW / APPROVED / REJECTED のデータを全消去しますか？", ui.ButtonSet.YES_NO);
+  if (ok !== ui.Button.YES) return;
+
+  // REVIEW
+  if (review.getFilter()) review.getFilter().remove();
+  let maxRow = review.getLastRow();
+  if (maxRow >= 3) review.deleteRows(3, maxRow - 2);
+  if (maxRow >= 2) review.getRange(2, 1, 1, 20).clearContent();
+  setFormulasToReview_(review);
+
+  // APPROVED
+  if (approved.getFilter()) approved.getFilter().remove();
+  maxRow = approved.getLastRow();
+  if (maxRow >= 2) approved.getRange(2, 1, maxRow - 1, approved.getLastColumn()).clearContent();
+
+  // REJECTED
+  if (rejected.getFilter()) rejected.getFilter().remove();
+  maxRow = rejected.getLastRow();
+  if (maxRow >= 2) rejected.getRange(2, 1, maxRow - 1, rejected.getLastColumn()).clearContent();
+
+  ui.alert("🗑️ リセット完了（REVIEW数式も再注入済み）");
+}
+
+============================================================
+FILE: GAS/admin_db.js
+============================================================
+const MIDDLE_SS_ID = "1u7nJyh7wQDWN13nwmPfV0DI4ysOqsM1ef1UtIbA2ZgE";
+const MIDDLE_SHEET_NAME = "APPROVED_DAILY";
+
+const ADMIN_SHEET_NAME = "ADMIN_DAILY";
+const WORKER_SHEET_NAME = "SECRET_M_WORKER";
+
+// ✅ 1行目ヘッダーの辞書（列ズレに強い）
+const JP_HEADER_ALIASES = {
+  key:      ["管理ID", "uniqueKey", "ID"],
+  ym:       ["年月", "YM", "請求月"],
+  date:     ["日付", "Date", "作業日"],
+
+  site:     ["現場名（元請/現場）", "現場名", "現場", "場所", "Site"],
+  workType: ["契約種別（常用/請負）", "契約種別", "常用/請負"],  // ★追加
+  worker:   ["職人名", "氏名", "名前", "Worker"],
+  qty:      ["人工", "稼働", "Qty"],
+  ot:       ["残業H", "残業(H)", "残業", "OT"],
+  status:   ["状態", "ステータス", "Status"],                 // ★追加
+
+  // マスタ・計算列
+  base:   ["(マスタ)基本日当", "基本日当"],
+  rate:   ["(マスタ)残業倍率", "残業倍率"],
+  manual: ["【手動】日当変更", "手動"],
+  fixed:  ["確定日当", "確定"],
+  total:  ["最終支給額", "支給額（給与）", "支給額", "【手動】支給額上書き"]
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("管理メニュー")
+    .addItem("① 承認済データを取り込む（同期）", "syncFromMiddleJP")
+    .addToUi();
+}
+
+function syncFromMiddleJP() {
+  const ui = SpreadsheetApp.getUi();
+  const adminSS = SpreadsheetApp.getActiveSpreadsheet();
+  const adminSheet = adminSS.getSheetByName(ADMIN_SHEET_NAME);
+  const workerSheet = adminSS.getSheetByName(WORKER_SHEET_NAME);
+
+  if (!adminSheet) throw new Error(`Sheet not found: ${ADMIN_SHEET_NAME}`);
+  if (!workerSheet) throw new Error(`Sheet not found: ${WORKER_SHEET_NAME}`);
+
+  // 1) Adminヘッダー解析
+  const col = getHeaderMapJP_(adminSheet);
+
+  // ★必須項目に「契約種別」追加
+  const required = ["key", "ym", "date", "site", "workType", "worker", "qty", "ot", "status"];
+  const missing = required.filter(k => !col[k]);
+
+  if (missing.length > 0) {
+    ui.alert("ヘッダーが見つかりません: " + missing.join(", "));
+    return;
+  }
+
+  // 2) Middle(承認済)取得
+  let middleSheet;
+  try {
+    middleSheet = SpreadsheetApp.openById(MIDDLE_SS_ID).getSheetByName(MIDDLE_SHEET_NAME);
+  } catch(e) {
+    ui.alert("Middleファイルにアクセスできません。IDを確認してください。");
+    return;
+  }
+  if (!middleSheet) {
+    ui.alert("Middleシートが見つかりません");
+    return;
+  }
+
+  const lastRow = middleSheet.getLastRow();
+  if (lastRow < 2) {
+    ui.alert("Middle側に承認済みデータがありません");
+    return;
+  }
+
+  // ✅ Middle APPROVED_DAILY は 14列（A〜N）
+  // 0 管理ID
+  // 1 日付
+  // 2 年月
+  // 3 取引先名
+  // 4 契約種別（常用/請負）
+  // 5 現場名
+  // 6 職人名
+  // 7 人工
+  // 8 残業H
+  // 9 元メッセージID
+  // 10 登録日時
+  // 11 状態（APPROVED）
+  // 12 承認者
+  // 13 承認時刻
+  const data = middleSheet.getRange(2, 1, lastRow - 1, 14).getValues();
+
+  // 3) マスタ & 既存データ確認
+  const validWorkers = loadValidWorkersJP_(workerSheet);
+  const existingKeys = loadExistingKeys_(adminSheet, col.key);
+
+  const newObjs = [];
+  let skippedDup = 0;
+  const missingNames = new Set();
+
+  for (const r of data) {
+    const key = String(r[0] || "").trim();
+    if (!key) continue;
+
+    // 既にAdminにあるならスキップ
+    if (existingKeys.has(key)) { skippedDup++; continue; }
+
+    const workerName = String(r[6] || "").trim();
+    if (!validWorkers.has(workerName)) {
+      if (workerName) missingNames.add(workerName);
+      continue;
+    }
+
+    const client = String(r[3] || "").trim();
+    const workType = String(r[4] || "").trim();
+    const site = String(r[5] || "").trim();
+
+    // ✅ 現場名は「取引先 / 現場」に統一（見やすい）
+    const siteMerged = (client && site) ? `${client} / ${site}` : (site || client);
+
+    newObjs.push({
+      key: key,
+      ym: r[2],
+      date: r[1],
+      site: siteMerged,
+      workType: workType,    // ★ここに別列で入れる
+      worker: workerName,
+      qty: r[7],
+      ot: r[8],
+      status: String(r[11] || "APPROVED") // ★状態列に入れる
+    });
+  }
+
+  if (newObjs.length === 0) {
+    let msg = `新規取込なし\n(重複スキップ: ${skippedDup}件)`;
+    if (missingNames.size > 0) {
+      msg += `\n\n⚠️以下の職人名がマスタ「SECRET_M_WORKER」に無いため、取り込めませんでした：\n[ ${Array.from(missingNames).join(", ")} ]\n\n↑この名前をA列に追加してください。`;
+    }
+    ui.alert(msg);
+    return;
+  }
+
+  // 4) Adminへ書き込み
+  const startRow = adminSheet.getLastRow() + 1;
+  const lastCol = adminSheet.getLastColumn();
+  const out = Array.from({ length: newObjs.length }, () => Array(lastCol).fill(""));
+
+  for (let i = 0; i < newObjs.length; i++) {
+    const o = newObjs[i];
+    setCell_(out[i], col.key, o.key);
+    setCell_(out[i], col.ym, o.ym);
+    setCell_(out[i], col.date, o.date);
+    setCell_(out[i], col.site, o.site);
+    setCell_(out[i], col.workType, o.workType); // ★追加
+    setCell_(out[i], col.worker, o.worker);
+    setCell_(out[i], col.qty, o.qty);
+    setCell_(out[i], col.ot, o.ot);
+    setCell_(out[i], col.status, o.status);     // ★追加
+  }
+
+  adminSheet.getRange(startRow, 1, out.length, lastCol).setValues(out);
+
+  // 5) 計算式と書式
+  applyFormulasJP_(adminSheet, col, startRow, out.length);
+  applyFormatsJP_(adminSheet, col, startRow, out.length);
+
+  ui.alert(`同期完了: ${newObjs.length}件取り込みました`);
+}
+
+// ---------------- Helper ----------------
+
+function getHeaderMapJP_(sheet) {
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return {};
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v).trim());
+  const map = {};
+  for (const k in JP_HEADER_ALIASES) {
+    const idx = header.findIndex(h => JP_HEADER_ALIASES[k].includes(h));
+    if (idx >= 0) map[k] = idx + 1;
+  }
+  return map;
+}
+
+function loadValidWorkersJP_(s) {
+  const last = s.getLastRow();
+  if (last < 2) return new Set();
+  const d = s.getRange(2, 1, last - 1, 3).getValues();
+  const set = new Set();
+  d.forEach(r => { if (r[0]) set.add(String(r[0]).trim()); });
+  return set;
+}
+
+function loadExistingKeys_(s, k) {
+  const last = s.getLastRow();
+  if (last < 2) return new Set();
+  const vals = s.getRange(2, k, last - 1, 1).getValues().flat();
+  return new Set(vals.map(String));
+}
+
+function setCell_(row, c, v) { if (c) row[c - 1] = v; }
+function colToA1_(c) {
+  let s = "";
+  while (c > 0) { s = String.fromCharCode(65 + (c - 1) % 26) + s; c = Math.floor((c - 1) / 26); }
+  return s;
+}
+
+// ▼▼▼ 残業倍率を「1.25固定」にする ▼▼▼
+function applyFormulasJP_(s, c, r, n) {
+  if (!c.base || !c.total) return;
+
+  const w = colToA1_(c.worker), q = colToA1_(c.qty), o = colToA1_(c.ot);
+  const b = colToA1_(c.base), rt = colToA1_(c.rate), m = colToA1_(c.manual), f = colToA1_(c.fixed);
+
+  const formulas = Array.from({ length: n }, (_, i) => {
+    const idx = r + i;
+    return [
+      `=IFERROR(VLOOKUP(${w}${idx}, ${WORKER_SHEET_NAME}!A:C, 2, 0), 0)`, // 基本日当
+      "1.25", // 🔴 残業倍率固定
+      ``,
+      `=IF(${m}${idx}<>"", ${m}${idx}, ${b}${idx})`, // 確定日当
+      `=ROUNDDOWN(${f}${idx}*${q}${idx} + (${f}${idx}/8*${rt}${idx})*${o}${idx})` // 最終計算
+    ];
+  });
+
+  if (c.base + 4 === c.total) {
+    s.getRange(r, c.base, n, 5).setFormulas(formulas);
+  }
+}
+
+function applyFormatsJP_(s, c, r, n) {
+  if (c.date) s.getRange(r, c.date, n, 1).setNumberFormat("yyyy/mm/dd");
+  if (c.qty)  s.getRange(r, c.qty,  n, 1).setNumberFormat("0.00");
+  if (c.ot)   s.getRange(r, c.ot,   n, 1).setNumberFormat("0.00");
+
+  // 🔴 1.25を「1」表示にしない
+  if (c.rate) s.getRange(r, c.rate, n, 1).setNumberFormat("0.00");
+
+  if (c.total) s.getRange(r, c.total, n, 1).setNumberFormat("#,##0");
+}
+
+============================================================
+FILE: cloudeflare worker/worker.js
+============================================================
+export default {
+  async fetch(request, env, ctx) {
+    const GAS_EXEC_URL = "url";
+    
+    // LINE等の検証アクセス(GET)には即座に200を返して終了
+    if (request.method !== "POST") {
+      return new Response("OK", { status: 200 });
+    }
+
+    try {
+      // LINEからのメッセージ内容(JSON)を取得
+      const body = await request.text();
+
+      // 裏側でGASに投げ込む（完了を待たずにLINEにはOKを返す：非同期実行）
+      ctx.waitUntil(
+        fetch(GAS_EXEC_URL, {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json" 
+          },
+          body: body,
+          redirect: "follow", // GASのリダイレクト(302)を自動追従
+        }).then(res => {
+          // 成功確認用ログ（Cloudflareのログで確認可能）
+          console.log(`Sent to GAS. Status: ${res.status}`);
+        }).catch(err => {
+          // エラーログ
+          console.log(`Failed to send to GAS: ${err}`);
+        })
+      );
+
+      // LINEサーバーには即座に成功(200)を返す
+      return new Response("OK", { status: 200 });
+
+    } catch (e) {
+      // 万が一のWorker内エラー
+      console.log(`Worker Error: ${e}`);
+      return new Response("Error", { status: 500 });
+    }
+  },
+};
+
