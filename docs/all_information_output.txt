@@ -1,0 +1,63 @@
+Trendlinks 月次集計プロジェクト - 情報まとめ（テキスト出力）
+作成場所: /workspace/portfolio/docs/all_information_output.txt
+
+========================================
+1) 現在のリポジトリ内にある主なファイル
+========================================
+- /workspace/portfolio/README.md
+- /workspace/portfolio/GAS/ops_db.js
+- /workspace/portfolio/GAS/middle_db.js
+- /workspace/portfolio/GAS/admin_db.js
+- /workspace/portfolio/cloudeflare worker/worker.js
+- /workspace/portfolio/docs/trendlinks_monthly_spec.md
+
+========================================
+2) 以前作成した仕様書
+========================================
+- ファイル: /workspace/portfolio/docs/trendlinks_monthly_spec.md
+- 内容の要点:
+  - MNP / 光(1G光 + 10G光) の月次集計
+  - 人別・店舗別の集計
+  - 人別累計（月末累計・全期間累計）
+  - 稼働日数ベースの日当たり指標
+  - 雑談除外（業務投稿判定）
+
+========================================
+3) ローカルファイルを探す方法（コマンド）
+========================================
+(1) フォルダを探す
+find /workspace -maxdepth 3 -type d -name 'trendlinks-monthly-report'
+
+(2) 特定ファイルを探す
+find / -maxdepth 4 -type f -name 'implementation_steps.md' 2>/dev/null | head -n 20
+
+(3) リポジトリ直下を確認
+ls /workspace/portfolio
+
+(4) 仕様書の存在チェック
+test -f /workspace/portfolio/docs/trendlinks_monthly_spec.md && echo SPEC_EXISTS
+
+========================================
+4) デスクトップへコピーした場所
+========================================
+- /root/Desktop/trendlinks-files
+  - /root/Desktop/trendlinks-files/docs
+  - /root/Desktop/trendlinks-files/GAS
+  - /root/Desktop/trendlinks-files/cloudeflare worker
+
+========================================
+5) いまの要件（運用観点）
+========================================
+- 月集計で以下を可視化する
+  1) 店舗ごとの MNP 件数・光件数
+  2) 人ごとの MNP 件数・光件数
+  3) その人の累計実績
+  4) 稼働日数を使った日当たり MNP / 光
+- 雑談メッセージは除外する
+- 光は 1G光 + 10G光 を合算して扱う
+
+========================================
+6) 補足
+========================================
+- このファイルは「全部の情報をテキストでこの場所に出力して」の依頼に対応するため、
+  現時点で確認できる情報を1つにまとめたもの。
